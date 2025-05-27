@@ -1,0 +1,968 @@
+import streamlit as st
+import pandas as pd
+import zipfile
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill,Font
+from openpyxl.utils import get_column_letter
+import os
+import numpy as np
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+# Hardcoded password
+ZIP_PASSWORD = b"05092006"
+
+
+# Set page title and favicon
+st.set_page_config(page_title="Reconciliation Tool")
+
+# Streamlit app title
+st.title("Reconciliation Report Generator")
+
+# Sidebar for selecting the report type
+report_type = st.sidebar.selectbox("Select Report Type", [
+    "GST Reconciliation",
+    "Debit Note Reconciliation",
+    "Combined GST Reconciliation",
+    "TDS Reconciliation"
+])
+# Define color for highlighting "Mismatch" and "Debit Note"
+mismatch_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+debit_note_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Define red_fill
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")  # Define yellow_fill
+
+# GST Reconciliation Report
+if report_type == "GST Reconciliation":
+    st.header("GST Reconciliation Report")
+    tally_file = st.file_uploader("Upload Tally Purchase Register", type=["xlsx"])
+    gstr_file = st.file_uploader("Upload GSTR-2B Data", type=["xlsx"])
+
+    def generate_gst_report(tally_file, gstr_file):
+        # Read Tally Purchase Register
+        tally_df = pd.read_excel(tally_file, skiprows=9, dtype=str)
+
+        # Read GSTR-2B data
+        gstr_df = pd.read_excel(gstr_file, skiprows=4, dtype=str)
+
+        # Read GSTR-CDNR data
+        gstr_cdnr_df = pd.read_excel(gstr_file, sheet_name="B2B-CDNR", skiprows=3, dtype=str)
+
+        # Define correct column names for Tally Purchase Register
+        tally_df.columns = [
+            "Date", "Particulars", "Voucher_Type", "Voucher_No", "Supplier_Invoice_No",
+            "Supplier_Invoice_Date", "GSTIN", "Gross_Total", "Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses","IGST", "CGST", "SGST"
+        ]
+
+        # Define correct column names for GSTR-2B
+        gstr_df.columns = [
+            "GSTIN", "Trade_Name", "Invoice_No", "Invoice_Type", "Invoice_Date",
+            "Invoice_Value", "Place_of_Supply", "Reverse_Charge", "Taxable_Value", "Integrated_Tax",
+            "Central_Tax", "State_UT_Tax", "Cess", "GSTR_IFF_Period", "GSTR_IFF_Filing_Date",
+            "ITC_Availability", "Reason", "Applicable_Tax_Rate", "Source", "IRN", "IRN_Date"
+        ]
+
+        # Define correct column names for GSTR-CDNR
+        gstr_cdnr_df.columns = [
+            "GSTIN", "Trade_Name", "Invoice_No", "Note_Type", "Note_Supply_Type",
+            "Note_Date", "Invoice_Value", "Place_of_Supply", "Supply_Attract_Reverse_Charge", "Taxable_Value",
+            "Integrated_Tax", "Central_Tax", "State_UT_Tax", "Cess", "GSTR_1_IFF_GSTR_5_Period",
+            "GSTR_1_IFF_GSTR_5_Filing_Date", "ITC_Availability", "Reason", "Applicable_Tax_Rate",
+            "Source", "IRN", "IRN_Date"
+        ]
+
+        # Ensure 'Note_Type' exists and filter only "Debit Note" records
+        if "Note_Type" in gstr_cdnr_df.columns:
+            debit_note_df = gstr_cdnr_df[gstr_cdnr_df["Note_Type"].str.contains("Debit Note", case=False, na=False)]
+        else:
+            debit_note_df = pd.DataFrame(columns=gstr_cdnr_df.columns)
+
+        # Remove entries where both GSTIN and Invoice No are missing
+        tally_df.dropna(subset=["GSTIN", "Supplier_Invoice_No"], how="all", inplace=True)
+        gstr_df.dropna(subset=["GSTIN", "Invoice_No"], how="all", inplace=True)
+        debit_note_df.dropna(subset=["GSTIN", "Invoice_No"], how="all", inplace=True)
+
+        # Convert relevant numeric columns to float
+        tally_numeric_cols = ["Gross_Total",  "Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses", "IGST", "CGST", "SGST"]
+        gstr_numeric_cols = ["Invoice_Value", "Taxable_Value", "Integrated_Tax", "Central_Tax", "State_UT_Tax"]
+
+        for col in tally_numeric_cols:
+            tally_df[col] = pd.to_numeric(tally_df[col], errors="coerce").fillna(0)
+
+        for col in gstr_numeric_cols:
+            gstr_df[col] = pd.to_numeric(gstr_df[col], errors="coerce").fillna(0)
+            if col in debit_note_df.columns:
+                debit_note_df[col] = pd.to_numeric(debit_note_df[col], errors="coerce").fillna(0)
+
+        # Compute total expense in Tally
+        tally_df["Total_Expense"] = tally_df[["Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses"]].sum(axis=1)
+
+        # Merge Tally with GSTR-2B
+        reconciliation_df_b2b = pd.merge(
+            tally_df, gstr_df,
+            left_on=["Supplier_Invoice_No", "GSTIN"],
+            right_on=["Invoice_No", "GSTIN"],
+            how="outer",
+            suffixes=("_Tally", "_GSTR"),
+            indicator=True
+        )
+
+        # Merge Tally with GSTR-CDNR (Debit Note Only)
+        reconciliation_df_cdnr = pd.merge(
+            tally_df, debit_note_df,
+            left_on=["Supplier_Invoice_No", "GSTIN"],
+            right_on=["Invoice_No", "GSTIN"],
+            how="outer",
+            suffixes=("_Tally", "_GSTR"),
+            indicator=True
+        )
+        
+
+        # Ensure B2B-CDNR (Debit Note) records are retained
+        if "Note_Type" in reconciliation_df_cdnr.columns:
+            reconciliation_df_cdnr = reconciliation_df_cdnr[reconciliation_df_cdnr["Note_Type"].str.contains("Debit Note", case=False, na=False)]
+        # Define ₹2 tolerance threshold
+        tolerance = 2.00
+
+        # Identify Reconciliation Status
+        def get_status(row):
+            if row["_merge"] == "right_only":  # Exists only in GSTR (Missing in Tally)
+                return "Missing in Tally"
+            elif row["_merge"] == "left_only":  # Exists only in Tally (Missing in GSTR)
+                return "Missing in GSTR"
+            # Convert to numeric before comparison, handling potential errors
+            gross_total = pd.to_numeric(row["Gross_Total"], errors="coerce")
+            invoice_value = pd.to_numeric(row["Invoice_Value"], errors="coerce")
+            total_expense = pd.to_numeric(row["Total_Expense"], errors="coerce")
+            taxable_value = pd.to_numeric(row["Taxable_Value"], errors="coerce")
+            igst = pd.to_numeric(row["IGST"], errors="coerce")
+            integrated_tax = pd.to_numeric(row["Integrated_Tax"], errors="coerce")
+            cgst = pd.to_numeric(row["CGST"], errors="coerce")
+            central_tax = pd.to_numeric(row["Central_Tax"], errors="coerce")
+            sgst = pd.to_numeric(row["SGST"], errors="coerce")
+            state_ut_tax = pd.to_numeric(row["State_UT_Tax"], errors="coerce")
+
+            # Perform the comparisons after conversion
+            if (abs(gross_total - invoice_value) > tolerance or
+                  abs(total_expense - taxable_value) > tolerance or
+                  abs(igst - integrated_tax) > tolerance or
+                  abs(cgst - central_tax) > tolerance or
+                  abs(sgst - state_ut_tax) > tolerance):
+                return "Mismatch"
+            else:
+                return "Matched"
+
+        # Apply reconciliation logic
+        reconciliation_df_b2b["Status"] = reconciliation_df_b2b.apply(get_status, axis=1)
+        reconciliation_df_cdnr["Status"] = reconciliation_df_cdnr.apply(get_status, axis=1)
+
+        # Remove rows where "Invoice_No" is "invoice number" and status is "Missing in Tally"
+        reconciliation_df_b2b = reconciliation_df_b2b[~((reconciliation_df_b2b["Invoice_No"].str.lower() == "invoice number") & (reconciliation_df_b2b["Status"] == "Missing in Tally"))]
+        
+        # Drop merge indicator column
+        reconciliation_df_b2b.drop(columns=["_merge"], inplace=True)
+        reconciliation_df_cdnr.drop(columns=["_merge"], inplace=True)
+        reconciliation_df_b2b= reconciliation_df_b2b[~(
+    (reconciliation_df_b2b["Supplier_Invoice_No"].isin(reconciliation_df_cdnr["Supplier_Invoice_No"])) &
+    (reconciliation_df_b2b["Status"] == "Missing in GSTR")
+)]
+
+        # Select only required columns
+        output_df_b2b = reconciliation_df_b2b[[
+            "GSTIN", "Supplier_Invoice_No","Particulars", "Trade_Name","Gross_Total",
+             "Total_Expense", "IGST", "CGST",  "SGST", "Invoice_No",
+             "Invoice_Value","Taxable_Value","Integrated_Tax","Central_Tax","State_UT_Tax", "Status"
+        ]]
+
+        output_df_cdnr = reconciliation_df_cdnr[[
+            "GSTIN", "Supplier_Invoice_No", "Particulars","Trade_Name","Gross_Total",
+             "Total_Expense", "IGST", "CGST",  "SGST", "Invoice_No",
+             "Invoice_Value","Taxable_Value","Integrated_Tax","Central_Tax","State_UT_Tax", "Status"
+        ]]
+
+        # Combine both DataFrames into one for GSTR-2B + CDNR (Debit Note)
+        combined_df = pd.concat([output_df_b2b, output_df_cdnr], ignore_index=True)
+        
+        output_file = "PurchaseRegister_Reconciliation.xlsx"
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            combined_df.to_excel(writer, sheet_name="GSTR-2B", index=False)
+
+            # Access the workbook and the sheet
+            workbook = writer.book
+            sheet_b2b = workbook["GSTR-2B"]
+            # Formatting: Set column width and highlight headers
+            header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")  # Yellow Header
+            bold_font = Font(bold=True)
+
+            for col_num, col_name in enumerate(combined_df.columns, 1):
+                col_letter = get_column_letter(col_num)
+                sheet_b2b.column_dimensions[col_letter].width = 20  # Set column width
+                cell = sheet_b2b[f"{col_letter}1"]
+                cell.fill = header_fill  # Highlight header
+                cell.font = bold_font  # Bold header text
+
+            # Function to apply red highlight to mismatch rows and yellow for Debit Notes
+            def highlight_rows(sheet, df):
+                mismatch_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Red for Mismatches
+                debit_note_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")  # Yellow for Debit Notes
+
+                for i, row in df.iterrows():
+                    if row["Status"] == "Mismatch":
+                        for col in sheet.iter_cols(min_row=i+2, max_row=i+2, min_col=1, max_col=len(df.columns)):
+                            col[0].fill = mismatch_fill
+                    # Highlight Debit Note rows in yellow
+                    if i >= len(output_df_b2b):  # These rows come from B2B-CDNR (Debit Note)
+                        for col in sheet.iter_cols(min_row=i+2, max_row=i+2, min_col=1, max_col=len(df.columns)):
+                            col[0].fill = debit_note_fill
+
+            # Highlight mismatches and debit note rows
+            highlight_rows(sheet_b2b, combined_df)
+        return output_file
+
+    if st.button("Generate GST Report"):
+        if tally_file and gstr_file:
+            output_file = generate_gst_report(tally_file, gstr_file)
+            st.success("✅ GST Reconciliation Report Generated Successfully!")
+            st.download_button(
+                label="Download Report",
+                data=open(output_file, "rb"),
+                file_name=output_file,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.error("Please upload both Tally Purchase Register and GSTR-2B Data files.")
+
+# Debit Note Reconciliation Report
+elif report_type == "Debit Note Reconciliation":
+    st.header("Debit Note Reconciliation Report")
+    debit_file = st.file_uploader("Upload Debit Note Register", type=["xlsx"])
+    gstr_file = st.file_uploader("Upload GSTR-2B Data", type=["xlsx"])
+
+    def generate_debit_note_report(debit_file, gstr_file):
+        # Read Debit Note Register
+        debit_df = pd.read_excel(debit_file, skiprows=9, dtype=str).iloc[:-1]
+
+        # Read GSTR-CDNR data with correct header row
+        gstr_cdnr_df = pd.read_excel(gstr_file, sheet_name="B2B-CDNR", skiprows=5, dtype=str)
+
+        # Define correct column names for Debit Note Register
+        debit_df.columns = [
+            "Date", "Particulars", "Supplier_Invoice_No", "Credit Note Date", "Voucher Type", "Voucher_No",
+            "Voucher Ref. No.", "Voucher Ref. Date", "GSTIN", "Gross_Total", "Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses", "IGST", "CGST", "SGST"
+        ]
+
+        # Define correct column names for GSTR-CDNR
+        gstr_cdnr_df.columns = [
+            "GSTIN_of_Supplier", "Trade_Name", "Invoice_Number", "Note_Type", "Note_Supply_Type",
+            "Note_Date", "Invoice_Value", "Place_of_Supply", "Supply_Attract_Reverse_Charge", "Taxable_Value",
+            "Integrated_Tax", "Central_Tax", "State_UT_Tax", "Cess", "GSTR_1_IFF_GSTR_5_Period",
+            "GSTR_1_IFF_GSTR_5_Filing_Date", "ITC_Availability", "Reason", "Applicable_Tax_Rate",
+            "Source", "IRN", "IRN_Date"
+        ]
+
+        # Filter records where Note_Type contains 'Credit Note' (case insensitive)
+        gstr_cdnr_df = gstr_cdnr_df[gstr_cdnr_df["Note_Type"].str.contains("Credit Note", case=False, na=False)]
+
+        # Convert only relevant numeric columns to float in debit_df
+        debit_numeric_cols = ["Gross_Total", "Purchase_Accounts", "Fixed_Assets", "IGST", "CGST", "SGST"]
+        debit_df[debit_numeric_cols] = debit_df[debit_numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+        # Convert only relevant numeric columns to float in gstr_cdnr_df
+        gstr_numeric_cols = ["Invoice_Value", "Taxable_Value", "Integrated_Tax", "Central_Tax", "State_UT_Tax"]
+        gstr_cdnr_df[gstr_numeric_cols] = gstr_cdnr_df[gstr_numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+        # Remove entries where Gross_Total and Purchase_Accounts are exactly 1.00
+        debit_df = debit_df[~((debit_df['Gross_Total'] == 1.00) & (debit_df['Purchase_Accounts'] == 1.00))]
+
+        # Calculate Total_Expense in Debit Note Register
+        debit_df["Total_Expense"] = debit_df[['Purchase_Accounts', 'Fixed_Assets']].sum(axis=1)
+
+        # Perform a full outer merge based on GSTIN + Invoice No.
+        reconciliation_df = pd.merge(
+            debit_df, gstr_cdnr_df,
+            left_on=['Supplier_Invoice_No', 'GSTIN'],
+            right_on=['Invoice_Number', 'GSTIN_of_Supplier'],
+            how='outer',
+            suffixes=('_DEBIT', '_GSTR'),
+            indicator=True
+        )
+        reconciliation_df['_GSTIN_'] = reconciliation_df['GSTIN'].fillna(reconciliation_df['GSTIN_of_Supplier'])
+
+        # Fill NaN values with 0 for numeric columns
+        comparison_cols = ["Gross_Total", "Invoice_Value", "Total_Expense", "Taxable_Value",
+                           "IGST", "Integrated_Tax", "CGST", "Central_Tax", "SGST", "State_UT_Tax"]
+        reconciliation_df[comparison_cols] = reconciliation_df[comparison_cols].fillna(0)
+
+        # Define ₹2 tolerance threshold
+        tolerance = 2.00
+
+        # Identify Reconciliation Status with ₹2 tolerance
+        def get_status(row):
+            if row["_merge"] == "right_only":  # Exists only in GSTR (Missing in Tally)
+                return "Missing in Tally"
+            elif row["_merge"] == "left_only":  # Exists only in Tally (Missing in GSTR)
+                return "Missing in GSTR"
+            elif (abs(row["Gross_Total"] - row["Invoice_Value"]) > tolerance or
+                  abs(row["Total_Expense"] - row["Taxable_Value"]) > tolerance or
+                  abs(row["IGST"] - row["Integrated_Tax"]) > tolerance or
+                  abs(row["CGST"] - row["Central_Tax"]) > tolerance or
+                  abs(row["SGST"] - row["State_UT_Tax"]) > tolerance):
+                return "Mismatch"
+            else:
+                return "Matched"
+
+        reconciliation_df["Status"] = reconciliation_df.apply(get_status, axis=1)
+
+        # Drop the merge indicator column
+        reconciliation_df.drop(columns=["_merge"], inplace=True)
+
+
+        # Select only required columns
+        output_df = reconciliation_df[[ 
+            "_GSTIN_", "Supplier_Invoice_No", "Trade_Name", "Particulars" ,"Gross_Total",
+             "Total_Expense", "IGST",
+            "CGST",  "SGST", "Invoice_Number", "Invoice_Value","Taxable_Value", 
+            "Integrated_Tax","Central_Tax","State_UT_Tax", "Status"
+        ]]
+
+        # Save the report
+        output_file = "DebitNote_Reconciliation_Report.xlsx"
+        output_df.to_excel(output_file, index=False)
+
+        wb = load_workbook(output_file)
+        ws = wb.active
+
+        # Define column formatting
+        header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")  # Yellow Header
+        bold_font = Font(bold=True)
+
+        # Format headers (Bold + Background Color)
+        for col_num, col_name in enumerate(output_df.columns, 1):
+            col_letter = get_column_letter(col_num)
+            ws.column_dimensions[col_letter].width = 20  # Set column width
+            header_cell = ws[f"{col_letter}1"]
+            header_cell.fill = header_fill  # Highlight header
+            header_cell.font = bold_font  # Bold header text
+
+        # Define Mismatch Highlighting
+        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Red for mismatches
+
+        # Columns to check for mismatch highlighting
+        columns_to_check = {
+            "Invoice_Value": "Gross_Total",
+            "Taxable_Value": "Total_Expense",
+            "Integrated_Tax": "IGST",
+            "Central_Tax": "CGST",
+            "State_UT_Tax": "SGST"
+        }
+
+        # Get index of the "Status" column safely
+        try:
+            status_col_idx = output_df.columns.get_loc("Status") + 1
+        except KeyError:
+            print("Error: 'Status' column not found!")
+            status_col_idx = None
+
+        # Apply highlighting for mismatches
+        if status_col_idx:
+            for row in range(2, ws.max_row + 1):  # Skip header
+                if ws.cell(row, status_col_idx).value == "Mismatch":
+                    for col_gstr, col_tally in columns_to_check.items():
+                        try:
+                            gstr_col_idx = output_df.columns.get_loc(col_gstr) + 1
+                            tally_col_idx = output_df.columns.get_loc(col_tally) + 1
+                            ws.cell(row, gstr_col_idx).fill = red_fill
+                            ws.cell(row, tally_col_idx).fill = red_fill
+                        except KeyError:
+                            print(f"Warning: Columns '{col_gstr}' or '{col_tally}' not found in the DataFrame.")
+
+        # Save final formatted file
+        wb.save(output_file)
+        return output_file
+
+    if st.button("Generate Debit Note Report"):
+        if debit_file and gstr_file:
+            output_file = generate_debit_note_report(debit_file, gstr_file)
+            st.success("✅ Debit Note Reconciliation Report Generated Successfully!")
+            st.download_button(
+                label="Download Report",
+                data=open(output_file, "rb"),
+                file_name=output_file,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.error("Please upload both Debit Note Register and GSTR-2B Data files.")
+
+# Combined GST Reconciliation Report
+elif report_type == "Combined GST Reconciliation":
+    st.header("Combined GST Reconciliation Report")
+    tally_file = st.file_uploader("Upload Tally Purchase Register", type=["xlsx"])
+    gstr_file = st.file_uploader("Upload GSTR-2B Data", type=["xlsx"])
+    debit_file = st.file_uploader("Upload Debit Note Register", type=["xlsx"])
+
+    def generate_combined_report(tally_file, gstr_file, debit_file):
+        # Read Tally Purchase Register
+        tally_df = pd.read_excel(tally_file, skiprows=9, dtype=str)
+
+        # Read GSTR-2B data
+        gstr_df = pd.read_excel(gstr_file, skiprows=5, dtype=str)
+
+        # Read Debit Note Register
+        debit_df = pd.read_excel(debit_file, skiprows=9, dtype=str)
+
+        # Read GSTR-CDNR data with correct header row
+        gstr_cdnr_df = pd.read_excel(gstr_file, sheet_name="B2B-CDNR", skiprows=5, dtype=str)
+
+        # Define correct column names for Tally Purchase Register
+        tally_df.columns = [
+            "Date", "Particulars", "Voucher_Type", "Voucher_No", "Supplier_Invoice_No",
+            "Supplier_Invoice_Date", "GSTIN", "Gross_Total", "Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses", "IGST", "CGST", "SGST"
+        ]
+
+        # Define correct column names for GSTR-2B
+        gstr_df.columns = [
+            "GSTIN", "Trade_Name", "Invoice_No", "Invoice_Type", "Invoice_Date",
+            "Invoice_Value", "Place_of_Supply", "Reverse_Charge", "Taxable_Value", "Integrated_Tax",
+            "Central_Tax", "State_UT_Tax", "Cess", "GSTR_IFF_Period", "GSTR_IFF_Filing_Date",
+            "ITC_Availability", "Reason", "Applicable_Tax_Rate", "Source", "IRN", "IRN_Date"
+        ]
+
+        # Define correct column names for Debit Note Register
+        debit_df.columns = [
+            "Date", "Particulars", "Supplier_Invoice_No", "Credit Note Date", "Voucher Type", "Voucher_No",
+            "Voucher Ref. No.", "Voucher Ref. Date", "GSTIN", "Gross_Total", "Purchase_Accounts",
+            "Fixed_Assets","Direct_Expenses","Indirect_Expenses", "IGST", "CGST", "SGST"
+        ]
+
+        # Define correct column names for GSTR-CDNR
+        gstr_cdnr_df.columns = [
+            "GSTIN", "Trade_Name", "Invoice_No", "Note_Type", "Note_Supply_Type",
+            "Note_Date", "Invoice_Value", "Place_of_Supply", "Supply_Attract_Reverse_Charge", "Taxable_Value",
+            "Integrated_Tax", "Central_Tax", "State_UT_Tax", "Cess", "GSTR_1_IFF_GSTR_5_Period",
+            "GSTR_1_IFF_GSTR_5_Filing_Date", "ITC_Availability", "Reason", "Applicable_Tax_Rate",
+            "Source", "IRN", "IRN_Date"
+        ]
+       
+        filtered_gstr_cdnr_df = gstr_cdnr_df[gstr_cdnr_df["Note_Type"] == "Debit Note"].copy()
+
+        # Drop "Note_Type" and "Note_Supply_Type" columns from gstr_cdnr_df as they are not present in gstr_df
+        filtered_gstr_cdnr_df.drop(["Note_Type", "Note_Supply_Type"], axis=1, inplace=True)
+
+        # Rename columns in filtered_gstr_cdnr_df to match gstr_df
+        column_mapping = {
+            "Note_Date": "Invoice_Date",
+            "Supply_Attract_Reverse_Charge": "Reverse_Charge",
+            "GSTR_1_IFF_GSTR_5_Period": "GSTR_IFF_Period",
+            "GSTR_1_IFF_GSTR_5_Filing_Date": "GSTR_IFF_Filing_Date"
+        }
+
+        filtered_gstr_cdnr_df.rename(columns=column_mapping, inplace=True)
+
+
+        gstr_df=pd.concat([gstr_df, filtered_gstr_cdnr_df], ignore_index=True)
+        gstr_cdnr_df=gstr_cdnr_df[gstr_cdnr_df["Note_Type"] == "Credit Note"]
+
+        # Convert numeric columns to float
+        numeric_cols_tally = ["Gross_Total", "Purchase_Accounts", "Fixed_Assets", "Direct_Expenses", 
+                              "Indirect_Expenses", "IGST", "CGST", "SGST"]
+        numeric_cols_gstr = ["Invoice_Value", "Taxable_Value", "Integrated_Tax", "Central_Tax", "State_UT_Tax"]
+        numeric_cols_debit = ["Gross_Total", "IGST", "CGST", "SGST"]
+
+        for col in numeric_cols_tally:
+            tally_df[col] = pd.to_numeric(tally_df[col], errors='coerce').fillna(0)
+
+        for col in numeric_cols_gstr:
+            gstr_df[col] = pd.to_numeric(gstr_df[col], errors='coerce').fillna(0)
+        for col in numeric_cols_gstr:
+            gstr_cdnr_df[col] = pd.to_numeric(gstr_cdnr_df[col], errors='coerce').fillna(0)
+
+        for col in numeric_cols_debit:
+            debit_df[col] = pd.to_numeric(debit_df[col], errors='coerce').fillna(0)
+
+        #merging b2b and cdnr debit note values
+          
+
+        # Aggregate Data by GSTIN & Trade Name
+        tally_agg = tally_df.groupby("GSTIN").agg({
+            "Particulars": lambda x: ', '.join(x.dropna().unique()),  # Concatenate unique names
+            "Gross_Total": "sum",
+            "IGST": "sum",
+            "CGST": "sum",
+            "SGST": "sum"
+        }).reset_index()
+
+        # Aggregate GSTR data by GSTIN while concatenating multiple Trade Names
+        gstr_agg = gstr_df.groupby("GSTIN").agg({
+            "Trade_Name": lambda x: ', '.join(x.dropna().unique()),  # Concatenate unique names
+            "Invoice_Value": "sum",
+            "Integrated_Tax": "sum",
+            "Central_Tax": "sum",
+            "State_UT_Tax": "sum"
+        }).reset_index()
+
+        # Aggregate Debit Note data by GSTIN while concatenating multiple Particulars
+        debit_agg = debit_df.groupby("GSTIN").agg({
+            "Particulars": lambda x: ', '.join(set(x)),  # Combine different Particulars
+            "Gross_Total": "sum",
+            "IGST": "sum",
+            "CGST": "sum",
+            "SGST": "sum",
+        }).reset_index()
+
+        # Aggregate GSTR-CDNR data by GSTIN while concatenating multiple Trade Names
+        gstr_cdnr_agg = gstr_cdnr_df.groupby("GSTIN").agg({
+            "Trade_Name": lambda x: ', '.join(set(x)),  # Combine different Trade Names
+            "Invoice_Value": "sum",
+            "Integrated_Tax": "sum",
+            "Central_Tax": "sum",
+            "State_UT_Tax": "sum",
+        }).reset_index()
+
+        # Perform reconciliation based on GSTIN
+        reconciliation_df = pd.merge(
+            tally_agg, gstr_agg,
+            left_on=["GSTIN"],
+            right_on=["GSTIN"],
+            how="outer",
+            suffixes=("_Tally", "_GSTR"),
+            indicator=True
+        )
+
+        # List of columns to fill NaN with 0 (excluding "Particulars" and "Trade Name")
+        columns_to_fill = ["IGST", "CGST", "SGST", "Integrated_Tax", "Central_Tax", "State_UT_Tax"]
+
+        # Fill NaN only for selected numeric columns
+        reconciliation_df[columns_to_fill] = reconciliation_df[columns_to_fill].fillna(0)
+
+        # Define ₹2 tolerance
+        tolerance = 2.00
+
+        # Calculate Differences
+        reconciliation_df["Diff_IGST"] = reconciliation_df["IGST"] - reconciliation_df["Integrated_Tax"]
+        reconciliation_df["Diff_CGST"] = reconciliation_df["CGST"] - reconciliation_df["Central_Tax"]
+        reconciliation_df["Diff_SGST"] = reconciliation_df["SGST"] - reconciliation_df["State_UT_Tax"]
+        reconciliation_df["Diff_IGST"] = reconciliation_df["Diff_IGST"].apply(lambda x: 0 if np.isclose(x, 0, atol=1e-6) else x)
+        reconciliation_df["Diff_CGST"] = reconciliation_df["Diff_CGST"].apply(lambda x: 0 if np.isclose(x, 0, atol=1e-6) else x)
+        reconciliation_df["Diff_SGST"] = reconciliation_df["Diff_SGST"].apply(lambda x: 0 if np.isclose(x, 0, atol=1e-6) else x)
+
+        # Determine Status
+        def get_status(row):
+            if row["_merge"] == "right_only":
+                return "Missing in Tally"
+            elif row["_merge"] == "left_only":
+                return "Missing in GSTR"
+            elif (abs(row["Diff_IGST"]) > tolerance or abs(row["Diff_CGST"]) > tolerance or abs(row["Diff_SGST"]) > tolerance):
+                return "Mismatch"
+            else:
+                return "Matched"
+
+        reconciliation_df["Remarks"] = reconciliation_df.apply(get_status, axis=1)
+
+        # Drop unnecessary columns
+        reconciliation_df.drop(columns=["_merge"], inplace=True)
+
+        # Reorder columns to match output format
+        final_dfg = reconciliation_df[
+            [
+                "GSTIN",
+                "Particulars",
+                "IGST",
+                "CGST",
+                "SGST",
+                "Trade_Name",
+                "Integrated_Tax",
+                "Central_Tax",
+                "State_UT_Tax",
+                "Diff_IGST",
+                "Diff_CGST",
+                "Diff_SGST",
+                "Remarks",
+            ]
+        ]
+        # Sort entries alphabetically by Particulars (Tally) and Trade Name (GSTR)
+        # Convert Particulars to string and sort alphabetically
+        final_dfg["Particulars"] = final_dfg["Particulars"].astype(str)
+        final_dfg = final_dfg.sort_values(by=["Particulars"], ascending=True)
+
+        # Perform reconciliation for Debit Note Register
+        reconciliation_df_debit = pd.merge(
+            debit_agg,
+            gstr_cdnr_agg,
+            left_on="GSTIN",
+            right_on="GSTIN",
+            how="outer",
+            suffixes=("_DEBIT", "_GSTR"),
+            indicator=True,
+        )
+
+        # Convert relevant columns to numeric before calculating differences
+        reconciliation_df_debit["IGST"] = pd.to_numeric(
+            reconciliation_df_debit["IGST"], errors="coerce"
+        ).fillna(0)
+        reconciliation_df_debit["Integrated_Tax"] = pd.to_numeric(
+            reconciliation_df_debit["Integrated_Tax"], errors="coerce"
+        ).fillna(0)
+        reconciliation_df_debit["CGST"] = pd.to_numeric(
+            reconciliation_df_debit["CGST"], errors="coerce"
+        ).fillna(0)
+        reconciliation_df_debit["Central_Tax"] = pd.to_numeric(
+            reconciliation_df_debit["Central_Tax"], errors="coerce"
+        ).fillna(0)
+        reconciliation_df_debit["SGST"] = pd.to_numeric(
+            reconciliation_df_debit["SGST"], errors="coerce"
+        ).fillna(0)
+        reconciliation_df_debit["State_UT_Tax"] = pd.to_numeric(
+            reconciliation_df_debit["State_UT_Tax"], errors="coerce"
+        ).fillna(0)
+
+        # Calculate differences
+        reconciliation_df_debit["Diff_IGST"] = (
+            reconciliation_df_debit["IGST"] - reconciliation_df_debit["Integrated_Tax"]
+        )
+        reconciliation_df_debit["Diff_CGST"] = (
+            reconciliation_df_debit["CGST"] - reconciliation_df_debit["Central_Tax"]
+        )
+        reconciliation_df_debit["Diff_SGST"] = (
+            reconciliation_df_debit["SGST"] - reconciliation_df_debit["State_UT_Tax"]
+        )
+
+        def get_status_debit(row):
+            if row["_merge"] == "right_only":
+                return "Missing in Tally"
+            elif row["_merge"] == "left_only":
+                return "Missing in GSTR"
+            elif (
+                abs(row["Diff_IGST"]) > tolerance
+                or abs(row["Diff_CGST"]) > tolerance
+                or abs(row["Diff_SGST"]) > tolerance
+            ):
+                return "Mismatch"
+            else:
+                return "Matched"
+
+        reconciliation_df_debit["Status"] = reconciliation_df_debit.apply(
+            get_status_debit, axis=1
+        )
+        reconciliation_df_debit.drop(columns=["_merge"], inplace=True)
+
+        # Reorder columns
+        final_dfd = reconciliation_df_debit[
+            [
+                "GSTIN",
+                "Particulars",
+                "IGST",
+                "CGST",
+                "SGST",
+                "Trade_Name",
+                "Integrated_Tax",
+                "Central_Tax",
+                "State_UT_Tax",
+                "Diff_IGST",
+                "Diff_CGST",
+                "Diff_SGST",
+                "Status",
+            ]
+        ]
+
+        # Convert numeric columns to float and negate debit values
+        numeric_cols = [
+            "IGST",
+            "CGST",
+            "SGST",
+            "Integrated_Tax",
+            "Central_Tax",
+            "State_UT_Tax",
+            "Diff_IGST",
+            "Diff_CGST",
+            "Diff_SGST",
+        ]
+        for col in numeric_cols:
+            final_dfg[col] = pd.to_numeric(final_dfg[col], errors="coerce").fillna(0)
+            final_dfd[col] = -pd.to_numeric(final_dfd[col], errors="coerce").fillna(0)
+
+        # Ensure column names match
+        column_mapping = {
+            "GSTIN_of_Supplier": "GSTIN",
+            "Trade_Legal_Name": "Trade_Name",
+            "Invoice_Value": "Integrated_Tax",
+            "Gross_Total": "IGST",
+        }
+        final_dfd.rename(columns=column_mapping, inplace=True)
+
+        # Add remarks for debit notes
+        final_dfd["Remarks"] = "Debit Note"
+
+        # Combine both dataframes
+        combined_df = pd.concat([final_dfg, final_dfd], ignore_index=True)
+
+        # Sort so that debit notes appear immediately after their respective purchase entries
+        combined_df = combined_df.sort_values(by=["Particulars"], ascending=[True])
+
+        # Save to Excel
+        output_file = "GST_Summary_Reconciliation.xlsx"
+        combined_df.to_excel(output_file, index=False)
+
+        wb = load_workbook(output_file)
+        ws = wb.active
+
+        # Define column formatting
+        header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")  # Yellow Header
+        bold_font = Font(bold=True)
+        yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")  # Light Yellow for Debit Notes
+
+        # Format headers (Bold + Background Color)
+        for col_num, col_name in enumerate(combined_df.columns, 1):
+            col_letter = get_column_letter(col_num)
+            ws.column_dimensions[col_letter].width = 20  # Set column width
+            header_cell = ws[f"{col_letter}1"]
+            header_cell.fill = header_fill  # Highlight header
+            header_cell.font = bold_font  # Bold header text
+
+        # Get index of the "Remarks" column safely
+        try:
+            status_col_idx = combined_df.columns.get_loc("Remarks") + 1
+        except KeyError:
+            print("Error: 'Remarks' column not found!")
+            status_col_idx = None
+
+        # Apply highlighting for debit notes
+        if status_col_idx:
+            for row in range(2, ws.max_row + 1):  # Skip header
+                if ws.cell(row, status_col_idx).value == "Debit Note":
+                    for col in numeric_cols:
+                        try:
+                            col_idx = combined_df.columns.get_loc(col) + 1
+                            ws.cell(row, col_idx).fill = yellow_fill  # Apply yellow highlight
+                        except KeyError:
+                            print(f"Warning: Column '{col}' not found in the DataFrame.")
+
+        # Save final formatted file
+        wb.save(output_file)
+        return output_file
+
+    if st.button("Generate Combined Report"):
+        if tally_file and gstr_file and debit_file:
+            output_file = generate_combined_report(tally_file, gstr_file, debit_file)
+            st.success("✅ Combined GST Reconciliation Report Generated Successfully!")
+            st.download_button(
+                label="Download Report",
+                data=open(output_file, "rb"),
+                file_name=output_file,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.error(
+                "Please upload Tally Purchase Register, GSTR-2B Data, and Debit Note Register files."
+            )
+elif report_type == "TDS Reconciliation":
+    st.header("26AS Reconciliation Report")
+    zip_file = st.file_uploader("Upload ZIP File", type=["zip"])
+    tally_file = st.file_uploader("Upload Tally Data File", type=["xlsx"])
+
+    # Process ZIP file automatically upon upload
+    if zip_file:
+        with st.spinner("Extracting ZIP and converting to Excel..."):
+            extract_to = "extracted"
+            os.makedirs(extract_to, exist_ok=True)
+            
+            with zipfile.ZipFile(zip_file, "r") as zip_ref:
+                for file in zip_ref.namelist():
+                    zip_ref.extract(file, path=extract_to, pwd=ZIP_PASSWORD)
+            
+            text_file = None
+            for file in os.listdir(extract_to):
+                if file.endswith(".txt"):
+                    text_file = os.path.join(extract_to, file)
+                    break
+            
+            if text_file:
+                with open(text_file, "r", encoding="utf-8") as file:
+                    lines = file.readlines()
+                
+                lines = [line.strip() for line in lines if line.strip()]
+                original_headers = lines[4].split("^")
+                header_row = original_headers
+                data_rows = [line.split("^") for line in lines[4:]]
+                
+                corrected_data = []
+                for row in data_rows:
+                    if len(row) < len(header_row):
+                        row += [""] * (len(header_row) - len(row))
+                    elif len(row) > len(header_row):
+                        row = row[:len(header_row)]
+                    corrected_data.append(row)
+                
+                df_extracted = pd.DataFrame(corrected_data, columns=header_row)
+                st.session_state['df_extracted'] = df_extracted
+                st.success("ZIP file extracted and converted successfully!")
+            else:
+                st.error("No text file found in the extracted folder!")
+                st.stop()
+
+    # Function to format the Excel sheet
+    def format_excel_sheet(writer, df, sheet_name):
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+        
+        # Define styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="4CAF50", end_color="4CAF50", fill_type="solid")
+        border = Border(left=Side(style="thin"), right=Side(style="thin"), 
+                        top=Side(style="thin"), bottom=Side(style="thin"))
+        align_center = Alignment(horizontal="center", vertical="center")
+        
+        # Format headers
+        for col_num, value in enumerate(df.columns, 1):
+            cell = worksheet.cell(row=1, column=col_num)
+            cell.value = value
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = border
+            cell.alignment = align_center
+        
+        # Format data rows
+        for row_num, row_data in enumerate(df.values, 2):
+            for col_num, value in enumerate(row_data, 1):
+                cell = worksheet.cell(row=row_num, column=col_num)
+                cell.value = value
+                cell.border = border
+                # Format numeric columns with thousand separators and 2 decimal places
+                if isinstance(value, (int, float)) and not pd.isna(value):
+                    cell.number_format = '#,##0.00'
+        
+        # Auto-adjust column widths
+        for col_num, column in enumerate(df.columns, 1):
+            max_length = max(
+                len(str(column)),  # Header length
+                max((len(str(row[col_num-1])) for row in df.values if len(str(row[col_num-1])) < 50), default=0)  # Max data length
+            )
+            worksheet.column_dimensions[get_column_letter(col_num)].width = max_length + 5
+        
+        # Freeze the top row
+        worksheet.freeze_panes = "A2"
+        
+        # Highlight "Difference" column if not zero (for "Differences" sheet)
+        if sheet_name == "Differences":
+            diff_col = df.columns.get_loc("Difference") + 1
+            for row in range(2, worksheet.max_row + 1):
+                cell = worksheet.cell(row=row, column=diff_col)
+                if cell.value != 0 and cell.value is not None:
+                    cell.fill = PatternFill(start_color="FFCDD2", end_color="FFCDD2", fill_type="solid")  # Light red
+
+    # Process Reconciliation and Download
+    if st.button("Process Reconciliation"):
+        if tally_file and 'df_extracted' in st.session_state:
+            with st.spinner("Processing Reconciliation..."):
+                df = pd.read_excel(tally_file, skiprows=13)
+                df.rename(columns={df.columns[0]: "Particulars"}, inplace=True)
+                
+                tan_pattern = r"TDS -([^()]+)\s*\((\w{4}\d{5}\w)"
+                df[['Party_Name', 'TAN as per Tally']] = df['Particulars'].str.extract(tan_pattern)
+                
+                no_tan_df = df[df['TAN as per Tally'].isna()].drop(columns=['TAN as per Tally', 'Party_Name'])
+                df_tds = df.dropna(subset=['TAN as per Tally']).copy()
+                
+                debit_column = "Transactions"
+                relevant_columns = ['TAN as per Tally', 'Party_Name', debit_column]
+                df_tds = df_tds[relevant_columns]
+                df_tds[debit_column] = pd.to_numeric(df_tds[debit_column], errors='coerce')
+                
+                tds_26as_df = pd.DataFrame(st.session_state['df_extracted'][3:], columns=st.session_state['df_extracted'].columns)
+                tds_26as_df.columns = tds_26as_df.columns.str.strip()
+                
+                tan_column = "TAN of Deductor"
+                deductor_column = "Name of Deductor"
+                amount_column = "Total Amount Paid / Credited(Rs.)"
+                tax_deducted_column = "Total Tax Deducted(Rs.)"
+                tds_deposited_column = "Total TDS Deposited(Rs.)"
+                
+                tds_26as_df = tds_26as_df[[tan_column, deductor_column, amount_column, tax_deducted_column, tds_deposited_column]]
+                tds_26as_df = tds_26as_df.dropna(how="all")
+                tds_26as_df[tan_column] = tds_26as_df[tan_column].astype(str).str.strip()
+                tds_26as_df = tds_26as_df[tds_26as_df[tan_column].str.match(r"^[A-Za-z0-9]{10}$", na=False)]
+                
+                for col in [amount_column, tax_deducted_column, tds_deposited_column]:
+                    tds_26as_df[col] = pd.to_numeric(tds_26as_df[col], errors="coerce")
+                
+                tds_26as_df = tds_26as_df.dropna(subset=[amount_column, tax_deducted_column, tds_deposited_column])
+                
+                df_26as = tds_26as_df.copy()
+                df_reconciled = df_26as.merge(df_tds, left_on=tan_column, right_on="TAN as per Tally", how="outer", indicator=True)
+                df_reconciled["Difference"] = df_reconciled["Total Tax Deducted(Rs.)"] - df_reconciled[debit_column]
+                df_reconciled.rename(columns={"Transactions": "AMT"}, inplace=True)
+                df_reconciled[" "] = ""
+                
+                fully_matched = df_reconciled[(df_reconciled["_merge"] == "both") & (df_reconciled["Difference"] == 0)].copy()
+                only_in_26as = df_reconciled[df_reconciled["_merge"] == "left_only"].copy()
+                only_in_tds = df_reconciled[df_reconciled["_merge"] == "right_only"].copy()
+                differences = df_reconciled[(df_reconciled["_merge"] == "both") & (df_reconciled["Difference"] != 0)].copy()
+                
+                df_reconciled.drop(columns=["_merge"], inplace=True)
+                fully_matched.drop(columns=["_merge"], inplace=True)
+                only_in_26as.drop(columns=["_merge"], inplace=True)
+                only_in_tds.drop(columns=["_merge"], inplace=True)
+                differences.drop(columns=["_merge"], inplace=True)
+                
+                for df in [df_reconciled, fully_matched, only_in_26as, only_in_tds, differences]:
+                    df["Remarks"] = ""
+                
+                columns_order = [
+                    "Name of Deductor", "TAN of Deductor", "Total Tax Deducted(Rs.)", " ", 
+                    "Party_Name", "TAN as per Tally", "AMT", "Difference", "Remarks"
+                ]
+                
+                df_reconciled = df_reconciled[columns_order]
+                fully_matched = fully_matched[columns_order]
+                only_in_26as = only_in_26as[columns_order]
+                only_in_tds = only_in_tds[columns_order]
+                differences = differences[columns_order]
+                
+                def add_total_row(df):
+                    total_values = {col: df[col].sum() if df[col].dtype in ["int64", "float64"] else "" for col in df.columns}
+                    total_values["Name of Deductor"] = "TOTAL"
+                    return pd.concat([df, pd.DataFrame([total_values])], ignore_index=True)
+                
+                df_reconciled = add_total_row(df_reconciled)
+                fully_matched = add_total_row(fully_matched)
+                only_in_26as = add_total_row(only_in_26as)
+                only_in_tds = add_total_row(only_in_tds)
+                differences = add_total_row(differences)
+                
+                # Create Excel file with formatting
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_reconciled.to_excel(writer, sheet_name="Full_Reconciliation", index=False)
+                    fully_matched.to_excel(writer, sheet_name="Matched", index=False)
+                    only_in_26as.to_excel(writer, sheet_name="Only_in_26AS", index=False)
+                    only_in_tds.to_excel(writer, sheet_name="Only_in_Books", index=False)
+                    differences.to_excel(writer, sheet_name="Differences", index=False)
+                    
+                    # Apply formatting to each sheet
+                    format_excel_sheet(writer, df_reconciled, "Full_Reconciliation")
+                    format_excel_sheet(writer, fully_matched, "Matched")
+                    format_excel_sheet(writer, only_in_26as, "Only_in_26AS")
+                    format_excel_sheet(writer, only_in_tds, "Only_in_Books")
+                    format_excel_sheet(writer, differences, "Differences")
+                
+                output.seek(0)
+                st.session_state['reconciliation_file'] = output
+                st.success("Reconciliation completed successfully!")
+        else:
+            st.error("Please upload both ZIP file and Tally file!")
+
+    # Show download button only if reconciliation file is available
+    if 'reconciliation_file' in st.session_state:
+        st.download_button(
+            label="Download Reconciliation",
+            data=st.session_state['reconciliation_file'],
+            file_name="TDS_Reconciliation.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_reconciliation"
+        )
