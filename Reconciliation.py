@@ -863,8 +863,13 @@ elif report_type == "TDS Reconciliation":
                 df = pd.read_excel(tally_file, skiprows=13)
                 df.rename(columns={df.columns[0]: "Particulars"}, inplace=True)
                 
-                tan_pattern = r"TDS -([^()]+)\s*\((\w{4}\d{5}\w)"
-                df[['Party_Name', 'TAN as per Tally']] = df['Particulars'].str.extract(tan_pattern)
+                df.rename(columns={
+                df.columns[0]: "Particulars",
+                df.columns[1]: "TAN as per Tally",
+                df.columns[2]: "Transactions"
+            }, inplace=True)
+                df["Party_Name"] = df["Particulars"].str.replace(r"^TDS\s*-", "", regex=True).str.strip()
+
                 
                 no_tan_df = df[df['TAN as per Tally'].isna()].drop(columns=['TAN as per Tally', 'Party_Name'])
                 df_tds = df.dropna(subset=['TAN as per Tally']).copy()
